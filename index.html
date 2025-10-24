@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Drug Adverse Event Search (openFDA)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#0b1220; --card:#111a2b; --ink:#e8eefc; --muted:#a9b6d3; --accent:#5aa0ff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--ink); background:linear-gradient(180deg,#0b1220,#07101e); }
+    header { padding:24px; border-bottom:1px solid #1f2a44; position:sticky; top:0; background:#0b1220cc; backdrop-filter:saturate(150%) blur(6px); }
+    h1 { margin:0 0 8px; font-size:1.25rem; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    input[type="text"] { flex:1 1 260px; padding:12px 14px; border-radius:12px; border:1px solid #243150; background:#0d1628; color:var(--ink); outline:none; }
+    button { padding:12px 16px; border-radius:12px; border:1px solid #2a3b62; background:var(--card); color:var(--ink); cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    main { max-width:1100px; margin:24px auto; padding:0 16px 64px; }
+
+    .meta { margin:16px 0; color:var(--muted); font-size:0.95rem; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:12px; }
+    @media (min-width: 860px) { .grid { grid-template-columns: 1fr 1fr; } }
+
+    .card { background:var(--card); border:1px solid #1c2741; border-radius:16px; padding:16px; }
+    .card h3 { margin:0 0 4px; font-size:1rem; }
+    .pill { display:inline-block; border:1px solid #2a3b62; border-radius:999px; padding:4px 8px; margin:4px 4px 0 0; font-size:0.8rem; color:var(--muted); }
+    .reactions { margin-top:8px; }
+    .muted { color:var(--muted); }
+    .section-title { margin:24px 0 8px; font-weight:600; }
+    .error { color:#ffb3b3; background:#3a0e13; border:1px solid #6e1d28; padding:12px; border-radius:12px; }
+    .controls { display:flex; gap:8px; align-items:center; margin-top:12px; }
+    .linkish { color:var(--accent); cursor:pointer; }
+    .spinner { width:16px; height:16px; border:2px solid #2a3b62; border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; display:inline-block; vertical-align:middle; }
+    @keyframes spin { to { transform:rotate(360deg);} }
+    .small { font-size:0.88rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Search Drug Adverse Event Reports (openFDA)</h1>
+    <div class="row">
+      <input id="q" type="text" placeholder="Try: ibuprofen, acetaminophen, Ozempic, amoxicillin…" />
+      <button id="searchBtn">Search</button>
+      <button id="clearBtn" title="Clear results">Clear</button>
+    </div>
+    <div class="controls small">
+      <span class="muted">Results per page:</span>
+      <button data-size="10">10</button>
+      <button data-size="20">20</button>
+      <button data-size="50">50</button>
+      <span id="status" class="muted"></span>
+    </div>
+  </header>
+
+  <main>
+    <div id="summary"></div>
+
+    <div id="topReactions"></div>
+
+    <div id="meta" class="meta"></div>
+
+    <div id="results" class="grid"></div>
+
+    <div id="pager" class="controls" style="display:none">
+      <button id="prevBtn">← Prev</button>
+      <span id="pageInfo" class="muted"></span>
+      <button id="nextBtn">Next →</button>
+    </div>
+  </main>
+
+  <script>
+    const BASE = 'https://api.fda.gov/drug/event.json';
+    const state = { q:'', limit:10, skip:0, total:0, loading:false };
+
+    const el = id => document.getElementById(id);
+    const qInput = el('q');
+    const searchBtn = el('searchBtn');
+    const clearBtn = el('clearBtn');
+    const resultsEl = el('results');
+    const metaEl = el('meta');
+    const pagerEl = el('pager');
+    const prevBtn = el('prevBtn');
+    const nextBtn = el('nextBtn');
+    const pageInfo = el('pageInfo');
+    const statusEl = el('status');
+    const summaryEl = el('summary');
+    const topReactionsEl = el('topReactions');
+
+    // Quick size controls
+    document.querySelectorAll('button[data-size]').forEach(b=>{
+      b.addEventListener('click', ()=>{
+        state.limit = parseInt(b.dataset.size,10);
+        state.skip = 0;
+        if (state.q) run();
+      });
+    });
+
+    searchBtn.addEventListener('click', () => {
+      state.q = qInput.value.trim();
+      state.skip = 0;
+      run();
+    });
+
+    qInput.addEventListener('keydown', (e)=>{
+      if (e.key === 'Enter') { searchBtn.click(); }
+    });
+
+    clearBtn.addEventListener('click', ()=>{
+      qInput.value = '';
+      state.q = '';
+      state.skip = 0;
+      state.total = 0;
+      resultsEl.innerHTML = '';
+      metaEl.textContent = '';
+      pagerEl.style.display = 'none';
+      summaryEl.innerHTML = '';
+      topReactionsEl.innerHTML = '';
+      status('');
+    });
+
+    prevBtn.addEventListener('click', ()=>{
+      state.skip = Math.max(0, state.skip - state.limit);
+      run();
+    });
+    nextBtn.addEventListener('click', ()=>{
+      state.skip = state.skip + state.limit;
+      run();
+    });
+
+    function status(msg){ statusEl.innerHTML = msg || ''; }
+
+    function buildSearchQuery(userText){
+      // Search across multiple common fields for the drug mention
+      const term = userText.trim();
+      const quoted = `"${term}"`;
+      const enc = encodeURIComponent(quoted);
+      // medicinalproduct often contains uppercase brand/generic; also include openfda fields
+      return [
+        `patient.drug.medicinalproduct:${enc}`,
+        `patient.drug.openfda.brand_name:${enc}`,
+        `patient.drug.openfda.generic_name:${enc}`,
+        `patient.drug.openfda.substance_name:${enc}`
+      ].join('+OR+');
+    }
+
+    function humanDate(yyyymmdd){
+      if (!yyyymmdd) return '—';
+      const s = String(yyyymmdd);
+      const y = s.slice(0,4), m = s.slice(4,6), d = s.slice(6,8);
+      const dt = new Date(`${y}-${m}-${d}T00:00:00Z`);
+      return dt.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'2-digit'});
+    }
+
+    function seriousnessFlags(rec){
+      const keys = [
+        ['serious', 'Serious'],
+        ['seriousnessdeath','Death'],
+        ['seriousnesslifethreatening','Life-threatening'],
+        ['seriousnessdisabling','Disabling'],
+        ['seriousnesshospitalization','Hospitalization'],
+        ['seriousnesscongenitalanomali','Congenital anomaly'],
+        ['seriousnessother','Other serious']
+      ];
+      return keys.filter(([k]) => rec[k] === '1').map(([,label]) => label);
+    }
+
+    async function run(){
+      if (!state.q){ alert('Type a medication name first.'); return; }
+      try{
+        state.loading = true;
+        status(`<span class="spinner"></span> Searching…`);
+
+        // Build the main events query
+        const search = buildSearchQuery(state.q);
+        const url = `${BASE}?search=${search}&limit=${state.limit}&skip=${state.skip}`;
+        const resp = await fetch(url);
+        if (!resp.ok){
+          const text = await resp.text();
+          throw new Error(`HTTP ${resp.status} — ${text}`);
+        }
+        const data = await resp.json();
+
+        state.total = data?.meta?.results?.total ?? 0;
+        renderMeta();
+        renderResults(data?.results || []);
+
+        // Fetch top reactions summary (independent call)
+        fetchTopReactions(search);
+
+        status('');
+      } catch(err){
+        console.error(err);
+        resultsEl.innerHTML = `<div class="error"><strong>Request failed.</strong><br>${escapeHtml(err.message || err)}</div>`;
+        metaEl.textContent = '';
+        pagerEl.style.display = 'none';
+        summaryEl.innerHTML = '';
+        topReactionsEl.innerHTML = '';
+        status('');
+      } finally {
+        state.loading = false;
+      }
+    }
+
+    async function fetchTopReactions(search){
+      try{
+        topReactionsEl.innerHTML = '';
+        // Count endpoint for top reactions (API returns up to ~1000 buckets; we show top 12)
+        const url = `${BASE}?search=${search}&count=patient.reaction.reactionmeddrapt.exact`;
+        const resp = await fetch(url);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const buckets = (data?.results || []).slice(0,12);
+        if (!buckets.length) return;
+
+        const chips = buckets.map(b => `<span class="pill">${escapeHtml(b.term)} — ${b.count.toLocaleString()}</span>`).join('');
+        topReactionsEl.innerHTML = `
+          <div class="section-title">Top reactions (sampled)</div>
+          <div>${chips}</div>
+        `;
+      } catch {}
+    }
+
+    function renderMeta(){
+      const from = state.total ? (state.skip + 1) : 0;
+      const to = Math.min(state.skip + state.limit, state.total);
+      metaEl.innerHTML = `Showing <strong>${from || 0}-${to || 0}</strong> of <strong>${state.total.toLocaleString()}</strong> reports for <strong>${escapeHtml(state.q)}</strong>.`;
+      if (state.total > 0){
+        pagerEl.style.display = 'flex';
+        prevBtn.disabled = (state.skip === 0);
+        nextBtn.disabled = (state.skip + state.limit >= state.total);
+        pageInfo.textContent = `Page ${Math.floor(state.skip/state.limit)+1} of ${Math.ceil(state.total/state.limit)}`;
+      } else {
+        pagerEl.style.display = 'none';
+      }
+      // Little context line
+      summaryEl.innerHTML = `<div class="muted small">Source: FDA FAERS via openFDA Drug Event API.</div>`;
+    }
+
+    function renderResults(items){
+      if (!items.length){
+        resultsEl.innerHTML = `<div class="muted">No reports found. Try a different spelling (e.g., “acetaminophen” vs “Tylenol”) or a broader term.</div>`;
+        return;
+      }
+      resultsEl.innerHTML = items.map(it => renderCard(it)).join('');
+    }
+
+    function renderCard(r){
+      const id = r.safetyreportid || '—';
+      const date = humanDate(r.receivedate);
+      const flags = seriousnessFlags(r);
+      const reactions = (r.patient?.reaction || []).map(x => x.reactionmeddrapt).filter(Boolean);
+      const drugs = (r.patient?.drug || []);
+      const suspects = drugs
+        .filter(d => String(d.drugcharacterization) === '1')
+        .map(d => pickDrugName(d));
+      const allDrugs = drugs.map(d => pickDrugName(d));
+      const sex = (r.patient?.patientsex === '1') ? 'Male' : (r.patient?.patientsex === '2') ? 'Female' : 'Unknown';
+      const age = r.patient?.patientonsetage ? `${r.patient.patientonsetage} (${r.patient.patientonsetageunit || 'age units'})` : '—';
+
+      return `
+        <article class="card">
+          <h3>Report #${escapeHtml(id)}</h3>
+          <div class="muted small">Received: ${date} • Patient sex: ${sex} • Onset age: ${escapeHtml(age)}</div>
+
+          ${flags.length ? `<div class="reactions">${flags.map(f=>`<span class="pill">${escapeHtml(f)}</span>`).join('')}</div>` : ''}
+
+          <div class="section-title">Reactions</div>
+          <div class="reactions">${reactions.length ? reactions.map(t=>`<span class="pill">${escapeHtml(t)}</span>`).join('') : '<span class="muted">None listed</span>'}</div>
+
+          <div class="section-title">Suspect drug(s)</div>
+          <div class="reactions">${suspects.length ? suspects.map(n=>`<span class="pill">${escapeHtml(n)}</span>`).join('') : '<span class="muted">None marked as suspect</span>'}</div>
+
+          <div class="section-title">All reported drug(s)</div>
+          <div class="reactions">${allDrugs.length ? allDrugs.map(n=>`<span class="pill">${escapeHtml(n)}</span>`).join('') : '<span class="muted">—</span>'}</div>
+        </article>
+      `;
+    }
+
+    function pickDrugName(d){
+      // Prefer brand_name array, then generic_name, then medicinalproduct
+      const ofda = d.openfda || {};
+      const bn = Array.isArray(ofda.brand_name) && ofda.brand_name[0];
+      const gn = Array.isArray(ofda.generic_name) && ofda.generic_name[0];
+      const sn = Array.isArray(ofda.substance_name) && ofda.substance_name[0];
+      return bn || gn || sn || d.medicinalproduct || 'Unknown';
+    }
+
+    // Simple HTML escaper
+    function escapeHtml(s){
+      return String(s ?? '').replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
+
+    // Optional: prefill an example for fast testing
+    qInput.value = 'ibuprofen';
+    // Auto-run once on load
+    // run();
+  </script>
+</body>
+</html>
